@@ -16,6 +16,9 @@ public sealed class NotificationEnvelope
     [JsonPropertyName("recipients")]
     public IReadOnlyCollection<Guid> Recipients { get; set; } = Array.Empty<Guid>();
 
+    [JsonPropertyName("channels")]
+    public IReadOnlyCollection<string>? Channels { get; set; }
+
     [JsonPropertyName("title")]
     public string Title { get; set; } = string.Empty;
 

@@ -3,10 +3,13 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Notifications.Api.Data;
+using Notifications.Api.Hubs;
 using Notifications.Api.Infrastructure;
 using Notifications.Api.Options;
 using Notifications.Api.Services;
+using Notifications.Api.Services.Web;
 using Notifications.Api.Workers;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -44,6 +47,8 @@ builder.Services.AddSwaggerGen(options =>
     });
 });
 
+var hubPath = builder.Configuration.GetValue<string>($"{WebNotificationsOptions.ConfigurationSectionName}:HubPath") ?? "/hubs/notifications";
+
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
@@ -66,6 +71,22 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                 ValidateIssuerSigningKey = false
             };
         }
+
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                var requestPath = context.HttpContext.Request.Path;
+
+                if (!string.IsNullOrEmpty(accessToken) && requestPath.StartsWithSegments(hubPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Token = accessToken;
+                }
+
+                return Task.CompletedTask;
+            }
+        };
     });
 
 builder.Services.AddAuthorization();
@@ -74,12 +95,15 @@ builder.Services.AddSingleton<IAmazonSimpleNotificationService, AmazonSimpleNoti
 
 builder.Services.Configure<AwsOptions>(builder.Configuration.GetSection("Aws"));
 builder.Services.Configure<OutboxWorkerOptions>(builder.Configuration.GetSection("OutboxWorker"));
+builder.Services.Configure<WebNotificationsOptions>(builder.Configuration.GetSection(WebNotificationsOptions.ConfigurationSectionName));
 
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddSingleton<IClock, SystemClock>();
 builder.Services.AddSingleton<INpgsqlConnectionFactory, NpgsqlConnectionFactory>();
 builder.Services.AddScoped<ICurrentUserProvider, CurrentUserProvider>();
 builder.Services.AddScoped<IDeviceRegistrationService, DeviceRegistrationService>();
+builder.Services.AddSingleton<IWebNotificationPublisher, SignalRWebNotificationPublisher>();
+builder.Services.AddSignalR();
 builder.Services.AddHostedService<OutboxWorker>();
 
 var app = builder.Build();
@@ -94,5 +118,11 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
+
+var webOptions = app.Services.GetRequiredService<IOptions<WebNotificationsOptions>>().Value;
+if (webOptions.Enabled)
+{
+    app.MapHub<NotificationsHub>(webOptions.HubPath).RequireAuthorization();
+}
 
 app.Run();

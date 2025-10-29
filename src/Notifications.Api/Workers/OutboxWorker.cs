@@ -12,6 +12,7 @@ using Notifications.Api.Data;
 using Notifications.Api.Infrastructure;
 using Notifications.Api.Models;
 using Notifications.Api.Options;
+using Notifications.Api.Services.Web;
 
 namespace Notifications.Api.Workers;
 
@@ -49,6 +50,7 @@ WHERE id = @Id;
     private readonly IOptionsMonitor<OutboxWorkerOptions> _workerOptions;
     private readonly IOptionsMonitor<AwsOptions> _awsOptions;
     private readonly ILogger<OutboxWorker> _logger;
+    private readonly IWebNotificationPublisher? _webNotificationPublisher;
     private readonly IClock _clock;
     private readonly JsonSerializerOptions _serializerOptions = new(JsonSerializerDefaults.Web)
     {
@@ -62,7 +64,8 @@ WHERE id = @Id;
         IOptionsMonitor<OutboxWorkerOptions> workerOptions,
         IOptionsMonitor<AwsOptions> awsOptions,
         ILogger<OutboxWorker> logger,
-        IClock clock)
+        IClock clock,
+        IWebNotificationPublisher? webNotificationPublisher = null)
     {
         _connectionFactory = connectionFactory;
         _snsClient = snsClient;
@@ -70,6 +73,7 @@ WHERE id = @Id;
         _awsOptions = awsOptions;
         _logger = logger;
         _clock = clock;
+        _webNotificationPublisher = webNotificationPublisher;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -103,9 +107,13 @@ WHERE id = @Id;
     private async Task<bool> ProcessBatchAsync(CancellationToken cancellationToken)
     {
         var awsOptions = _awsOptions.CurrentValue;
-        if (string.IsNullOrWhiteSpace(awsOptions.TopicArn))
+        var snsEnabled = !string.IsNullOrWhiteSpace(awsOptions.TopicArn);
+        var webPublisher = _webNotificationPublisher;
+        var webEnabled = webPublisher?.IsEnabled == true;
+
+        if (!snsEnabled && !webEnabled)
         {
-            _logger.LogWarning("AWS SNS topic ARN is not configured. Outbox worker will pause.");
+            _logger.LogWarning("No delivery channel configured. Outbox worker will pause.");
             await Task.Delay(TimeSpan.FromMilliseconds(_workerOptions.CurrentValue.PollIntervalMs), cancellationToken).ConfigureAwait(false);
             return false;
         }
@@ -127,7 +135,7 @@ WHERE id = @Id;
 
         foreach (var record in records)
         {
-            await ProcessRecordAsync(record, connection, transaction, awsOptions, cancellationToken).ConfigureAwait(false);
+            await ProcessRecordAsync(record, connection, transaction, awsOptions, snsEnabled, webPublisher, cancellationToken).ConfigureAwait(false);
         }
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -139,6 +147,8 @@ WHERE id = @Id;
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         AwsOptions awsOptions,
+        bool snsEnabled,
+        IWebNotificationPublisher? webPublisher,
         CancellationToken cancellationToken)
     {
         try
@@ -151,7 +161,7 @@ WHERE id = @Id;
                 throw new InvalidOperationException($"Outbox event {record.Id} has no recipients.");
             }
 
-            await PublishAsync(record, envelope, awsOptions, cancellationToken).ConfigureAwait(false);
+            await PublishAsync(record, envelope, awsOptions, snsEnabled, webPublisher, cancellationToken).ConfigureAwait(false);
 
             await connection.ExecuteAsync(new CommandDefinition(
                 MarkPublishedSql,
@@ -170,27 +180,41 @@ WHERE id = @Id;
         OutboxEventRecord record,
         NotificationEnvelope envelope,
         AwsOptions awsOptions,
+        bool snsEnabled,
+        IWebNotificationPublisher? webPublisher,
         CancellationToken cancellationToken)
     {
-        var messageAttributes = BuildMessageAttributes(envelope);
-
-        if (awsOptions.Fifo)
+        if (snsEnabled)
         {
-            await foreach (var request in BuildFifoRequestsAsync(record, envelope, awsOptions, messageAttributes, cancellationToken))
+            var messageAttributes = BuildMessageAttributes(envelope);
+
+            if (awsOptions.Fifo)
             {
+                await foreach (var request in BuildFifoRequestsAsync(record, envelope, awsOptions, messageAttributes, cancellationToken))
+                {
+                    await _snsClient.PublishAsync(request, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            else
+            {
+                var request = new PublishRequest
+                {
+                    TopicArn = awsOptions.TopicArn,
+                    Message = record.Payload,
+                    MessageAttributes = messageAttributes
+                };
+
                 await _snsClient.PublishAsync(request, cancellationToken).ConfigureAwait(false);
             }
         }
         else
         {
-            var request = new PublishRequest
-            {
-                TopicArn = awsOptions.TopicArn,
-                Message = record.Payload,
-                MessageAttributes = messageAttributes
-            };
+            _logger.LogDebug("Skipping SNS publish for event {EventId} because the topic ARN is not configured.", record.Id);
+        }
 
-            await _snsClient.PublishAsync(request, cancellationToken).ConfigureAwait(false);
+        if (webPublisher is not null && webPublisher.ShouldHandle(envelope))
+        {
+            await webPublisher.PublishAsync(envelope, cancellationToken).ConfigureAwait(false);
         }
     }
 
