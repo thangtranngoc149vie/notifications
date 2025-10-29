@@ -1,0 +1,9 @@
+bin/
+obj/
+*.user
+*.swp
+.vs/
+**/bin/
+**/obj/
+*.suo
+*.userprefs
